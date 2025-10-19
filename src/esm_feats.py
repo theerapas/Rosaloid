@@ -8,14 +8,47 @@ import numpy as np
 import pandas as pd
 import esm  # from fair-esm
 
+
 AA_RE = re.compile(r"^([A-Z])(\d+)([A-Z])$")
 
-# ---------- paths ----------
-CACHE_DIR = Path("data/cache")
-EMB_DIR   = CACHE_DIR / "embeddings"
-ZSHOT_DIR = CACHE_DIR / "zeroshot"
+# Prefer explicit env overrides; else default to CWD/data/cache
+CACHE_DIR = Path(os.getenv("ESM_CACHE_DIR", Path.cwd() / "data" / "cache")).resolve()
+EMB_DIR   = Path(os.getenv("ESM_EMB_DIR",  CACHE_DIR / "embeddings")).resolve()
+ZSHOT_DIR = Path(os.getenv("ESM_ZSHOT_DIR", CACHE_DIR / "zeroshot")).resolve()
+
 EMB_DIR.mkdir(parents=True, exist_ok=True)
 ZSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---- ultra-safe path writer for Windows + diagnostics ----
+def _safe_open_for_write(p: Path):
+    """Open a file for binary write with Windows long-path handling and hardening."""
+    p = Path(p).resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    s = os.fspath(p)
+    if os.name == "nt":
+        # Extended-length prefix avoids many Win32 path parser gotchas
+        if not s.startswith("\\\\?\\"):
+            s = "\\\\?\\" + s
+
+    try:
+        return open(s, "wb")
+    except OSError as e:
+        # Emit rich diagnostics once; then re-raise so callers can fallback if desired
+        print("[_safe_open_for_write] failure")
+        print("  path:      ", s)
+        print("  exists:    ", Path(p).exists())
+        print("  parent:    ", p.parent, " | exists:", p.parent.exists(), " | is_dir:", p.parent.is_dir())
+        # Try a trivial probe in the same directory to see if the dir is writable at all
+        try:
+            probe = p.parent / "_probe_write_.tmp"
+            with open(os.fspath(probe), "wb") as tf:
+                tf.write(b"ok")
+            probe.unlink(missing_ok=True)
+            print("  probe:     write OK in parent dir")
+        except Exception as pe:
+            print("  probe:     write FAILED in parent dir ->", pe)
+        raise
 
 # ---------- model loader (singleton) ----------
 _model_ctx = {}
@@ -81,6 +114,26 @@ def get_embedding(seq: str, model_tag: str = "esm1v_t33_650M_UR90S_1") -> np.nda
     Returns np.ndarray shape [d].
     """
     key = _seq_key(seq)
+    # npy_path = EMB_DIR / f"{key}.npy"
+    # if npy_path.exists():
+    #     return np.load(npy_path)
+
+    # model, alphabet, batch_converter, device = load_esm1v(model_tag)
+    # batch = [("seq", seq)]
+    # _, _, tokens = batch_converter(batch)
+    # tokens = tokens.to(device)
+
+    # out = model(tokens, repr_layers=[33], return_contacts=False)
+    # # per-token reps: [B, L, C], we want the last layer 33
+    # reps = out["representations"][33][0]  # [L, C]
+    # # Exclude BOS (index 0) and EOS (last index)
+    # reps = reps[1:-1]
+    # emb = reps.mean(dim=0).detach().cpu().numpy().astype(np.float32)
+
+    # np.save(npy_path, emb)
+    # return emb
+
+        # ...
     npy_path = EMB_DIR / f"{key}.npy"
     if npy_path.exists():
         return np.load(npy_path)
@@ -97,8 +150,19 @@ def get_embedding(seq: str, model_tag: str = "esm1v_t33_650M_UR90S_1") -> np.nda
     reps = reps[1:-1]
     emb = reps.mean(dim=0).detach().cpu().numpy().astype(np.float32)
 
-    np.save(npy_path, emb)
-    return emb
+    npy_path = (EMB_DIR / f"{key}.npy").resolve()
+    try:
+        with _safe_open_for_write(npy_path) as f:
+            np.save(f, emb)
+    except OSError:
+        # If we get here, the dir is hostile; fall back to CWD cache so pipeline can continue
+        fallback = Path.cwd() / "cache_embeddings_fallback"
+        fallback.mkdir(parents=True, exist_ok=True)
+        npy_path = (fallback / f"{key}.npy").resolve()
+        with open(os.fspath(npy_path), "wb") as f:
+            np.save(f, emb)
+    return np.load(os.fspath(npy_path))
+
 
 # ---------- zero-shot mutation score ----------
 @torch.no_grad()
@@ -151,24 +215,40 @@ def zero_shot_score(wt_seq: str, mutant: str, model_tag: str = "esm1v_t33_650M_U
 # ---------- batch helpers ----------
 def embed_dataframe(df: pd.DataFrame, seq_col: str = "mutated_sequence",
                     model_tag: str = "esm1v_t33_650M_UR90S_1") -> pd.DataFrame:
-    """
-    Add columns emb_path and optionally flatten to emb_* if you want.
-    Keeps caching; safe to re-run.
-    """
-    embs = []
-    for s in df[seq_col].tolist():
-        e = get_embedding(s, model_tag=model_tag)
-        embs.append(e)
+ 
+    from os import fspath
+    import gc
 
+    # 1) build the matrix
+    embs = [get_embedding(s, model_tag=model_tag) for s in df[seq_col].tolist()]
     E = np.stack(embs, axis=0)  # [N, d]
-    # Store a separate matrix file and just note its path in df to keep CSV light
-    key = hashlib.sha1(("|".join(df[seq_col].tolist())).encode()).hexdigest()
-    mat_path = EMB_DIR / f"matrix_{key}.npy"
-    np.save(mat_path, E)
+
+    # 2) stable key (order-insensitive: makes caching robust)
+    key = hashlib.sha1("|".join(sorted(map(str, df[seq_col].tolist()))).encode("utf-8")).hexdigest()
+
+    mat_path = (EMB_DIR / f"matrix_{key}.npy").resolve()
+    tmp_path = mat_path.with_suffix(".npy.tmp")
+
+    # 3) if exists, reuse (avoid write while another memmap may be open)
+    if mat_path.exists():
+        df_out = df.copy()
+        df_out["embedding_path"] = mat_path.as_posix()
+        return df_out
+
+    # 4) write atomically via temp -> replace
+    with _safe_open_for_write(tmp_path) as f:
+        np.save(f, E.astype(np.float32, copy=False))
+    try:
+        tmp_path.replace(mat_path)
+    except Exception:
+        # if another writer just created it between our temp and replace, keep theirs
+        pass
 
     df_out = df.copy()
-    df_out["embedding_path"] = str(mat_path)
+    df_out["embedding_path"] = mat_path.as_posix()
     return df_out
+
+
 
 def zero_shot_dataframe(df: pd.DataFrame, wt_seq: str, mutant_col: str = "mutant",
                         model_tag: str = "esm1v_t33_650M_UR90S_1") -> pd.DataFrame:
@@ -396,3 +476,95 @@ def pll_delta_dataframe_safe(
                 continue
             raise
     raise RuntimeError(f"PLLΔ OOM even with tiny batches. Last error: {last_err}")
+
+
+
+
+
+
+
+# additive wt-score
+@torch.no_grad()
+def _precompute_wt_mask_logprobs(
+    wt_seq: str,
+    model_tag: str = "esm1v_t33_650M_UR90S_1",
+    batch_size: int = 64,
+) -> Tuple[np.ndarray, list]:
+    """
+    For each WT position i, compute log p(AA | WT with position i masked) for 20 AAs.
+    Returns:
+      table: [L, 20] float32 with log-probs in the order aa_list
+      aa_list: list[str] of the 20 amino acids aligned to table's columns
+    Cached in data/cache/zeroshot to avoid recompute.
+    """
+    key = _seq_key("WTMASK|" + wt_seq)
+    cache = ZSHOT_DIR / f"wtmask_{key}.npz"
+    if cache.exists():
+        dat = np.load(cache, allow_pickle=False)
+        aa_list = json.loads(dat["aa_list"].tobytes().decode("utf-8"))
+        return dat["table"], aa_list
+
+    model, alphabet, batch_converter, device = load_esm1v(model_tag)
+    aa_list = list(alphabet.standard_toks)
+    aa_idx = torch.tensor([alphabet.get_idx(a) for a in aa_list], device=device)
+    mask_idx = alphabet.mask_idx
+
+    _, _, wt_tok = batch_converter([("WT", wt_seq)])
+    wt_tok = wt_tok.to(device)
+    L = len(wt_seq)
+    table = np.zeros((L, len(aa_list)), dtype=np.float32)
+
+    positions = list(range(1, L + 1))
+    for s in range(0, L, batch_size):
+        chunk = positions[s:s+batch_size]
+        B = len(chunk)
+        toks = wt_tok.repeat(B, 1)
+        for b, pos in enumerate(chunk):
+            toks[b, pos] = mask_idx
+        out = model(toks, repr_layers=[], return_contacts=False)
+        logits = out["logits"]  # [B, L+2, V]
+        logp = torch.log_softmax(logits, dim=-1)
+        for b, pos in enumerate(chunk):
+            table[pos-1, :] = logp[b, pos, aa_idx].detach().cpu().numpy()
+
+    np.savez(cache,
+             table=table,
+             aa_list=np.frombuffer(json.dumps(aa_list).encode("utf-8"), dtype=np.uint8))
+    return table, aa_list
+
+def _additive_score_from_table(mutant: str, wt_seq: str, table: np.ndarray, aa_list: list) -> float:
+    """Sum single-site Δlog p for each token in 'A42G:D85N:...' under WT context."""
+    aa_to_col = {aa: j for j, aa in enumerate(aa_list)}
+    total = 0.0
+    for tok in mutant.split(":"):
+        old, pos, new = tok[0], int(tok[1:-1]), tok[-1]
+        # Δ = log p(new|WT masked at pos) − log p(old|WT masked at pos)
+        total += float(table[pos-1, aa_to_col[new]] - table[pos-1, aa_to_col[old]])
+    return total
+
+def zero_shot_dataframe_additive_fast(
+    df: pd.DataFrame,
+    wt_seq: str,
+    mutant_col: str = "mutant",
+    seq_col: str = "mutated_sequence",
+    model_tag: str = "esm1v_t33_650M_UR90S_UR90S_1".replace("_UR90S_UR90S_1","_UR90S_1"),  # safety for typos
+) -> pd.DataFrame:
+    """
+    Paper-style additive zero-shot:
+      1) Precompute WT-mask table once.
+      2) Score each variant by summing single-site deltas from the table.
+    Works whether you have 'mutant' tokens or just the full 'mutated_sequence'.
+    Adds column: 'esm1v_zero_shot_add'.
+    """
+    table, aa_list = _precompute_wt_mask_logprobs(wt_seq, model_tag=model_tag)
+    if mutant_col in df.columns:
+        muts = df[mutant_col].astype(str).tolist()
+    else:
+        assert seq_col in df.columns, f"Need '{mutant_col}' or '{seq_col}'"
+        muts = [seq_to_mutant(wt_seq, s) for s in df[seq_col].astype(str)]
+    scores = [_additive_score_from_table(m, wt_seq, table, aa_list) for m in muts]
+    out = df.copy()
+    out["esm1v_zero_shot_add"] = np.array(scores, dtype=np.float32)
+    if mutant_col not in out.columns:
+        out[mutant_col] = muts
+    return out
