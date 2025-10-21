@@ -12,7 +12,7 @@ import esm  # from fair-esm
 AA_RE = re.compile(r"^([A-Z])(\d+)([A-Z])$")
 
 # Prefer explicit env overrides; else default to CWD/data/cache
-CACHE_DIR = Path(os.getenv("ESM_CACHE_DIR", Path.cwd() / "data" / "cache")).resolve()
+CACHE_DIR = Path(os.getenv("ESM_CACHE_DIR", Path.cwd().parent / "data" / "cache")).resolve()
 EMB_DIR   = Path(os.getenv("ESM_EMB_DIR",  CACHE_DIR / "embeddings")).resolve()
 ZSHOT_DIR = Path(os.getenv("ESM_ZSHOT_DIR", CACHE_DIR / "zeroshot")).resolve()
 
