@@ -1,0 +1,16 @@
+# Data
+data/*
+!data/README.md
+inputs/
+
+# Results & Cache
+results/*
+outputs/
+*.npy
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
